@@ -1,0 +1,325 @@
+# Hierarchical DAPC Provenance Assignment of Blind Cedrus libani Seed Lots
+# =========================================================================
+# Author: Lena Griebeling et al., 2026
+# Description:
+#   This script performs reference-trained Discriminant Analysis of Principal 
+#   Components (DAPC) for provenance assignment of blind Cedrus libani seed lots.
+#   Includes:
+#     1. Genotype data preprocessing & allele alignment
+#     2. Level 1: Global 5-cluster DAPC assignment
+#     3. Level 2: Hierarchical macro-regional DAPC (East vs. West)
+#     4. Level 3: Fine-scale within-region DAPC (Within-East & Within-West)
+# =========================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Setup & Package Dependencies
+# ------------------------------------------------------------------------------
+library(tidyverse)
+library(adegenet)
+library(patchwork)
+library(here)
+
+# Create output directories if they do not exist
+dir.create(here("output", "figures"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("output", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------------------------
+# 2. Data Import & Helper Functions
+# ------------------------------------------------------------------------------
+
+# Helper function to convert two-column-per-locus tibble to genind object
+tbl_to_genind <- function(df, id_col, pop_col = NULL) {
+  locus_names <- df |>
+    select(ends_with("_1")) |>
+    names() |>
+    str_remove("_1$")
+  
+  geno_mat <- map(locus_names, \(loc) {
+    a1 <- df[[paste0(loc, "_1")]]
+    a2 <- df[[paste0(loc, "_2")]]
+    case_when(
+      is.na(a1) | is.na(a2) ~ NA_character_,
+      TRUE ~ paste(a1, a2, sep = "/")
+    )
+  }) |>
+    set_names(locus_names) |>
+    as_tibble() |>
+    as.data.frame()
+  
+  rownames(geno_mat) <- df[[id_col]]
+  pop_vec <- if (!is.null(pop_col)) df[[pop_col]] else NULL
+  
+  df2genind(
+    geno_mat,
+    sep       = "/",
+    ind.names = df[[id_col]],
+    pop       = pop_vec,
+    ploidy    = 2,
+    NA.char   = NA
+  )
+}
+
+# Import raw data
+blind_raw <- read_delim(
+  here("data", "blind_data.csv"),
+  delim = ";",
+  trim_ws = TRUE,
+  show_col_types = FALSE
+)
+
+ref_raw <- read_delim(
+  here("data", "reference_data_nopop.csv"),
+  delim = ";",
+  trim_ws = TRUE,
+  show_col_types = FALSE
+)
+
+# Convert to genind objects
+ref_genind <- tbl_to_genind(ref_raw, id_col = "id", pop_col = "cluster")
+blind_genind_raw <- tbl_to_genind(blind_raw, id_col = "id", pop_col = "pop")
+
+# ------------------------------------------------------------------------------
+# 3. Allele Alignment & Cleaning
+# ------------------------------------------------------------------------------
+
+# Identify alleles present in blind data but absent in reference
+ref_alleles   <- colnames(tab(ref_genind))
+blind_alleles <- colnames(tab(blind_genind_raw))
+blind_only    <- setdiff(blind_alleles, ref_alleles)
+
+cat("Blind-only novel alleles identified:", paste(blind_only, collapse = ", "), "\n")
+
+# Treat genotypes with novel alleles as missing (NA)
+blind_only_locus <- str_extract(blind_only, "^[^.]+")
+names(blind_only_locus) <- blind_only
+blind_clean <- blind_raw
+
+for (loc in unique(blind_only_locus)) {
+  novel_alleles <- names(blind_only_locus)[blind_only_locus == loc]
+  col1 <- paste0(loc, "_1")
+  col2 <- paste0(loc, "_2")
+  
+  a1 <- as.character(blind_clean[[col1]])
+  a2 <- as.character(blind_clean[[col2]])
+  bad <- a1 %in% novel_alleles | a2 %in% novel_alleles
+  
+  blind_clean[[col1]][bad] <- NA
+  blind_clean[[col2]][bad] <- NA
+}
+
+blind_genind <- tbl_to_genind(blind_clean, id_col = "id", pop_col = "pop")
+
+# Repool reference + cleaned blind to establish a unified allele space
+pooled_genind <- repool(ref_genind, blind_genind)
+
+ref_idx   <- match(ref_raw$id, indNames(pooled_genind))
+blind_idx <- match(blind_raw$id, indNames(pooled_genind))
+
+ref_common   <- pooled_genind[ref_idx, ]
+blind_common <- pooled_genind[blind_idx, ]
+
+stopifnot(identical(colnames(tab(ref_common)), colnames(tab(blind_common))))
+cat("Allele alignment complete. Allele variables match exactly across datasets.\n")
+
+# ------------------------------------------------------------------------------
+# 4. Level 1: Global DAPC (K = 5)
+# ------------------------------------------------------------------------------
+
+# Optimise retained PCs using Cross-Validation (xvalDapc)
+set.seed(42)
+ref_xval <- xvalDapc(
+  tab(ref_common, NA.method = "mean", freq = TRUE),
+  pop(ref_common),
+  n.pca.max = 50,
+  training.set = 0.9,
+  result = "groupMean",
+  center = TRUE,
+  scale = FALSE,
+  n.rep = 100
+)
+
+n_pca_opt <- as.integer(ref_xval$`Number of PCs Achieving Highest Mean Success`)
+cat("Level 1 Optimal PCs retained:", n_pca_opt, "\n")
+
+# Train global DAPC model
+set.seed(42)
+dapc_ref_k5 <- dapc(ref_common, pop(ref_common), n.pca = n_pca_opt, n.da = 4)
+
+# Predict blind lot individuals
+blind_pred_k5 <- predict.dapc(dapc_ref_k5, newdata = blind_common)
+
+# Posterior probabilities
+posterior_k5 <- as_tibble(blind_pred_k5$posterior, rownames = "id") |>
+  mutate(
+    lot = blind_raw$pop[match(id, blind_raw$id)],
+    assigned = as.character(blind_pred_k5$assign),
+    max_support = apply(blind_pred_k5$posterior, 1, max)
+  )
+
+# Lot-level majority vote assignment
+lot_assignments_k5 <- posterior_k5 |>
+  count(lot, assigned, name = "n") |>
+  group_by(lot) |>
+  mutate(total = sum(n), support = n / total) |>
+  slice_max(order_by = n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    level = case_when(
+      support >= 0.75 ~ "clearly assigned",
+      support >= 0.40 ~ "predominantly assigned",
+      TRUE ~ "admixed / ambiguous"
+    )
+  )
+
+# Mean posterior probabilities per lot
+mean_posterior_k5 <- posterior_k5 |>
+  group_by(lot) |>
+  summarise(across(all_of(levels(pop(ref_common))), mean), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 5. Level 2: Hierarchical Macro-Regional DAPC (East vs. West)
+# ------------------------------------------------------------------------------
+
+east_pops <- c("Konya", "Mersin", "Kmaras")
+west_pops <- c("Antalya", "Isparta")
+
+ref_ew <- ref_common
+pop(ref_ew) <- factor(
+  ifelse(as.character(pop(ref_common)) %in% east_pops, "East", "West"),
+  levels = c("East", "West")
+)
+
+set.seed(42)
+ref_xval_ew <- xvalDapc(
+  tab(ref_ew, NA.method = "mean"),
+  pop(ref_ew),
+  n.pca.max = 30,
+  training.set = 0.9,
+  result = "groupMean",
+  center = TRUE,
+  scale = FALSE,
+  n.rep = 100
+)
+
+n_pca_ew <- as.integer(ref_xval_ew$`Number of PCs Achieving Highest Mean Success`)
+cat("Level 2 Optimal PCs retained:", n_pca_ew, "\n")
+
+set.seed(42)
+dapc_ref_ew <- dapc(ref_ew, pop(ref_ew), n.pca = n_pca_ew, n.da = 1)
+blind_pred_ew <- predict.dapc(dapc_ref_ew, newdata = blind_common)
+
+posterior_ew <- as_tibble(blind_pred_ew$posterior, rownames = "id") |>
+  mutate(
+    lot = blind_raw$pop[match(id, blind_raw$id)],
+    assigned = as.character(blind_pred_ew$assign),
+    max_support = apply(blind_pred_ew$posterior, 1, max)
+  )
+
+lot_assignments_ew <- posterior_ew |>
+  count(lot, assigned, name = "n") |>
+  group_by(lot) |>
+  mutate(total = sum(n), support = n / total) |>
+  slice_max(order_by = n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    level = case_when(
+      support >= 0.75 ~ "clearly assigned",
+      support >= 0.40 ~ "predominantly assigned",
+      TRUE ~ "admixed / ambiguous"
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# 6. Level 3: Fine-Scale Within-Region DAPC
+# ------------------------------------------------------------------------------
+
+# --- 6.1 Within-East DAPC ---
+ref_east <- ref_common[as.character(pop(ref_common)) %in% east_pops, ]
+blind_east_lots <- lot_assignments_ew |> filter(assigned == "East") |> pull(lot)
+blind_east <- blind_common[as.character(pop(blind_common)) %in% blind_east_lots, ]
+
+set.seed(42)
+ref_xval_east <- xvalDapc(
+  tab(ref_east, NA.method = "mean"),
+  pop(ref_east),
+  n.pca.max = 30,
+  training.set = 0.9,
+  result = "groupMean",
+  center = TRUE,
+  scale = FALSE,
+  n.rep = 100
+)
+
+n_pca_east <- as.integer(ref_xval_east$`Number of PCs Achieving Highest Mean Success`)
+cat("Level 3 Within-East Optimal PCs:", n_pca_east, "\n")
+
+set.seed(42)
+dapc_ref_east <- dapc(ref_east, pop(ref_east), n.pca = n_pca_east, n.da = 2)
+blind_pred_east <- predict.dapc(dapc_ref_east, newdata = blind_east)
+
+posterior_east <- as_tibble(blind_pred_east$posterior, rownames = "id") |>
+  mutate(
+    lot = as.character(pop(blind_east)),
+    assigned = as.character(blind_pred_east$assign),
+    max_support = apply(blind_pred_east$posterior, 1, max)
+  )
+
+lot_assignments_east <- posterior_east |>
+  count(lot, assigned, name = "n") |>
+  group_by(lot) |>
+  mutate(total = sum(n), support = n / total) |>
+  slice_max(order_by = n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    level = case_when(
+      support >= 0.75 ~ "clearly assigned",
+      support >= 0.40 ~ "predominantly assigned",
+      TRUE ~ "admixed / ambiguous"
+    )
+  )
+
+# --- 6.2 Within-West DAPC ---
+ref_west <- ref_common[as.character(pop(ref_common)) %in% west_pops, ]
+blind_west_lots <- lot_assignments_ew |> filter(assigned == "West") |> pull(lot)
+blind_west <- blind_common[as.character(pop(blind_common)) %in% blind_west_lots, ]
+
+set.seed(42)
+ref_xval_west <- xvalDapc(
+  tab(ref_west, NA.method = "mean"),
+  pop(ref_west),
+  n.pca.max = 30,
+  training.set = 0.9,
+  result = "groupMean",
+  center = TRUE,
+  scale = FALSE,
+  n.rep = 100
+)
+
+n_pca_west <- as.integer(ref_xval_west$`Number of PCs Achieving Highest Mean Success`)
+cat("Level 3 Within-West Optimal PCs:", n_pca_west, "\n")
+
+set.seed(42)
+dapc_ref_west <- dapc(ref_west, pop(ref_west), n.pca = n_pca_west, n.da = 1)
+blind_pred_west <- predict.dapc(dapc_ref_west, newdata = blind_west)
+
+posterior_west <- as_tibble(blind_pred_west$posterior, rownames = "id") |>
+  mutate(
+    lot = as.character(pop(blind_west)),
+    assigned = as.character(blind_pred_west$assign),
+    max_support = apply(blind_pred_west$posterior, 1, max)
+  )
+
+lot_assignments_west <- posterior_west |>
+  count(lot, assigned, name = "n") |>
+  group_by(lot) |>
+  mutate(total = sum(n), support = n / total) |>
+  slice_max(order_by = n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    level = case_when(
+      support >= 0.75 ~ "clearly assigned",
+      support >= 0.40 ~ "predominantly assigned",
+      TRUE ~ "admixed / ambiguous"
+    )
+  )
+
