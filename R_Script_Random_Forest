@@ -1,0 +1,161 @@
+# Random Forest Provenance Assignment of Blind Cedrus libani Seed Lots
+=========================================================================
+# Author: Griebeling et al., 2026
+# Description:
+#   This script performs reference-trained Random Forest (RF) classification 
+#   for provenance assignment of blind Cedrus libani seed lots. 
+#   Includes:
+#     1. Cross-validation (LGOCV, 200 iterations, 70/30 split)
+#     2. Seed lot assignment accuracy simulation (500 iterations)
+#     3. Final model training on full reference dataset
+#     4. Individual- and lot-level classification (Majority Vote)
+# =========================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Setup & Package Dependencies
+# ------------------------------------------------------------------------------
+library(caret)
+library(randomForest)
+library(dplyr)
+library(readr)
+library(here)
+
+# ------------------------------------------------------------------------------
+# 2. Data Import & Preprocessing
+# ------------------------------------------------------------------------------
+# Read reference and blind genotype datasets using relative paths
+ref_data <- read_delim(
+  here("data","raw", "reference_data.csv"), 
+  delim = ";", 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+)
+
+# Factorize population and remove non-marker columns ('id' and 'cluster')
+ref_data <- ref_data |> 
+  mutate(pop = as.factor(cluster)) |> 
+  select(-any_of(c("cluster", "id")))
+# ------------------------------------------------------------------------------
+# 3. Model Evaluation via Cross-Validation (LGOCV)
+# ------------------------------------------------------------------------------
+# Evaluate individual-level assignment accuracy via 200-repeat 70/30 splits
+set.seed(123)
+ctrl <- trainControl(
+  method = "LGOCV",          # Leave-Group-Out Cross-Validation
+  p = 0.7,                   # 70% Training / 30% Testing
+  number = 200,              # 200 Resampling iterations
+  classProbs = FALSE
+)
+
+rf_cv_model <- train(
+  pop ~ .,
+  data = ref_data,
+  method = "rf",
+  trControl = ctrl,
+  importance = TRUE
+)
+
+# Print individual classification accuracy & confusion matrix
+cat("Individual Assignment Accuracy (LGOCV):", 
+    round(rf_cv_model$results$Accuracy * 100, 2), "%\n")
+print(confusionMatrix(rf_cv_model))
+
+# ------------------------------------------------------------------------------
+# 4. Seed Lot Assignment Accuracy Simulation
+# ------------------------------------------------------------------------------
+# Simulate seed lots (n = 20 seedlings) across 500 resampling iterations
+set.seed(123)
+n_sim <- 500 
+lot_size <- 20
+clusters <- levels(ref_data$pop)
+lot_accuracy <- c()
+
+for (i in seq_len(n_sim)) {
+  # Generate 70/30 split
+  train_index <- createDataPartition(ref_data$pop, p = 0.7, list = FALSE)
+  train_data <- ref_data[train_index, ]
+  test_data  <- ref_data[-train_index, ]
+  
+  # Fit temporary model on training partition
+  rf_temp <- randomForest(pop ~ ., data = train_data)
+  
+  # Sample simulated seed lots from test partition
+  for (cl in clusters) {
+    inds <- which(test_data$pop == cl)
+    if (length(inds) >= lot_size) {
+      sampled <- sample(inds, lot_size)
+      preds <- predict(rf_temp, test_data[sampled, ])
+      majority <- names(sort(table(preds), decreasing = TRUE))[1]
+      lot_accuracy <- c(lot_accuracy, majority == cl)
+    }
+  }
+}
+
+cat("Simulated Seed Lot Assignment Accuracy:", 
+    round(mean(lot_accuracy) * 100, 2), "%\n")
+
+# ------------------------------------------------------------------------------
+# 5. Final Model Training
+# ------------------------------------------------------------------------------
+# Train final Random Forest classifier on the complete reference dataset
+set.seed(123)
+final_rf <- randomForest(
+  pop ~ .,
+  data = ref_data,
+  importance = TRUE,
+  ntree = 1000
+)
+
+# ------------------------------------------------------------------------------
+# 6. Blind Lot Prediction
+# ------------------------------------------------------------------------------
+blind_data <- read_delim(
+  here("data","raw", "blind_data.csv"), 
+  delim = ";", 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+)
+
+blind_markers <- blind_data |> select(-any_of(c("pop", "id")))
+
+# Predict individual categories and posterior probabilities
+blind_results <- blind_data |>
+  mutate(pred_cluster = predict(final_rf, newdata = blind_markers))
+
+blind_probs <- as_tibble(predict(final_rf, newdata = blind_markers, type = "prob"))
+blind_results <- bind_cols(blind_results, blind_probs)
+
+# ------------------------------------------------------------------------------
+# 7. Lot-Level Aggregation & Classification
+# ------------------------------------------------------------------------------
+
+# --- Method: Majority Vote Classification ---
+lot_majority <- blind_results |>
+  group_by(pop) |>
+  summarise(
+    assigned_cluster = names(sort(table(pred_cluster), decreasing = TRUE))[1],
+    support_n        = max(table(pred_cluster)),
+    total_n          = n(),
+    support_prob     = support_n / total_n,
+    .groups          = "drop"
+  ) |>
+  mutate(
+    assignment_status = case_when(
+      support_prob >= 0.75 ~ "clearly assigned",
+      support_prob >= 0.40 ~ "predominantly assigned",
+      TRUE ~ "genetically admixed or ambiguous"
+    )
+  )
+
+print(lot_majority)
+
+
+# ------------------------------------------------------------------------------
+# 8. Export Results
+# ------------------------------------------------------------------------------
+dir.create(here("output", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(lot_majority, here("output", "tables", "rf_lot_assignments_majority.csv"))
+
+cat("Random Forest analysis completed successfully. Results exported to output/tables/\n")
+
